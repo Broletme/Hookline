@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# YouTube cookies — export from browser, never commit
+cookies.txt
+
 # Python cache
 __pycache__/
 *.py[cod]

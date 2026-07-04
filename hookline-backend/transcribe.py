@@ -5,7 +5,13 @@ transcribe.py — Transcribe audio using Groq's Whisper-large-v3.
 import os
 from pathlib import Path
 
+import time
+
 from groq import Groq
+
+
+_MAX_RETRIES = 3
+_RETRY_DELAY = 5  # seconds, doubles each attempt
 
 
 def transcribe_audio(audio_path: Path) -> dict:
@@ -21,13 +27,25 @@ def transcribe_audio(audio_path: Path) -> dict:
     """
     client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-    with open(audio_path, "rb") as audio_file:
-        response = client.audio.transcriptions.create(
-            file=(audio_path.name, audio_file),
-            model="whisper-large-v3",
-            response_format="verbose_json",
-            timestamp_granularities=["segment", "word"],
-        )
+    last_err = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            with open(audio_path, "rb") as audio_file:
+                response = client.audio.transcriptions.create(
+                    file=(audio_path.name, audio_file),
+                    model="whisper-large-v3",
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment", "word"],
+                )
+            break  # success
+        except Exception as exc:
+            last_err = exc
+            if attempt < _MAX_RETRIES - 1:
+                wait = _RETRY_DELAY * (2 ** attempt)
+                print(f"[transcribe] Groq error (attempt {attempt+1}/{_MAX_RETRIES}), retrying in {wait}s: {exc}")
+                time.sleep(wait)
+    else:
+        raise RuntimeError(f"Transcription failed after {_MAX_RETRIES} attempts: {last_err}") from last_err
 
     # The response object has .text and .segments
     segments = []

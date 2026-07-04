@@ -26,7 +26,11 @@ def download_video(youtube_url: str, out_dir: Path) -> tuple[Path, Path]:
     video_path = out_dir / "video.mp4"
     audio_path = out_dir / "audio.mp3"
 
-    # --- Download video -------------------------------------------------------
+    # Cookies file — export from your browser using the "Get cookies.txt LOCALLY" extension.
+    # Place the exported file at hookline-backend/cookies.txt
+    # See: https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp
+    _cookies_path = Path(__file__).parent / "cookies.txt"
+
     ydl_opts = {
         "format": "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "outtmpl": str(video_path),
@@ -34,6 +38,9 @@ def download_video(youtube_url: str, out_dir: Path) -> tuple[Path, Path]:
         "quiet": True,
         "no_warnings": True,
     }
+
+    if _cookies_path.exists():
+        ydl_opts["cookiefile"] = str(_cookies_path)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([youtube_url])

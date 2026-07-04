@@ -5,6 +5,7 @@ scorer.py — Score transcript segments for viral clip potential using a Groq LL
 import json
 import os
 import re
+import time
 
 from groq import Groq
 
@@ -31,6 +32,9 @@ Format:
 ]
 """
 
+_MAX_RETRIES = 3
+_RETRY_DELAY = 5  # seconds, doubles each attempt
+
 
 def score_clips(transcript_text: str, video_duration: float) -> list[dict]:
     """Use an LLM to identify and score the best viral clip candidates.
@@ -52,15 +56,27 @@ def score_clips(transcript_text: str, video_duration: float) -> list[dict]:
         f"Transcript:\n{transcript_text}"
     )
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        temperature=0.3,
-        max_tokens=2048,
-    )
+    last_err = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=0.3,
+                max_tokens=2048,
+            )
+            break  # success
+        except Exception as exc:
+            last_err = exc
+            if attempt < _MAX_RETRIES - 1:
+                wait = _RETRY_DELAY * (2 ** attempt)
+                print(f"[scorer] Groq error (attempt {attempt+1}/{_MAX_RETRIES}), retrying in {wait}s: {exc}")
+                time.sleep(wait)
+    else:
+        raise RuntimeError(f"Scoring failed after {_MAX_RETRIES} attempts: {last_err}") from last_err
 
     raw = response.choices[0].message.content.strip()
 
