@@ -24,7 +24,7 @@ def download_video(youtube_url: str, out_dir: Path) -> tuple[Path, Path]:
         A tuple of (video_path, audio_path).
     """
     video_path = out_dir / "video.mp4"
-    audio_path = out_dir / "audio.wav"
+    audio_path = out_dir / "audio.mp3"
 
     # --- Download video -------------------------------------------------------
     ydl_opts = {
@@ -49,7 +49,8 @@ def download_video(youtube_url: str, out_dir: Path) -> tuple[Path, Path]:
         video_path = mp4_files[0]
 
     # --- Extract audio --------------------------------------------------------
-    # mono, 16 kHz, 16-bit PCM WAV — optimal for Whisper
+    # MP3 at 32 kbps mono — ~0.24 MB/min, well under Groq's 25 MB API limit.
+    # PCM WAV is ~1.9 MB/min and would exceed the limit for videos over ~13 min.
     cmd = [
         "ffmpeg",
         "-y",
@@ -57,7 +58,7 @@ def download_video(youtube_url: str, out_dir: Path) -> tuple[Path, Path]:
         "-vn",
         "-ac", "1",
         "-ar", "16000",
-        "-sample_fmt", "s16",
+        "-b:a", "32k",
         str(audio_path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
