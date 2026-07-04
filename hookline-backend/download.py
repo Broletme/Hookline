@@ -1,12 +1,11 @@
 """
-download.py — Download a YouTube video and extract its audio track.
+download.py — Download a YouTube video and extract its audio.
 
-Returns (video_path, audio_path) as pathlib.Path objects inside *out_dir*.
-The caller is responsible for providing (and later cleaning up) *out_dir*;
-typically this is a tempfile.TemporaryDirectory managed by main.py.
+IMPORTANT: Pin yt-dlp frequently (pip install -U yt-dlp) because YouTube's
+anti-bot JS challenge is patched continuously in yt-dlp hotfixes. If downloads
+fail with "Requested format is not available", update yt-dlp first before
+chasing JS runtime flags — that's almost always a stale yt-dlp issue.
 """
-
-from __future__ import annotations
 
 import subprocess
 from pathlib import Path
@@ -15,61 +14,56 @@ import yt_dlp
 
 
 def download_video(youtube_url: str, out_dir: Path) -> tuple[Path, Path]:
-    """
-    Download the best quality MP4 for *youtube_url* and extract a mono
-    16 kHz WAV audio track for Whisper transcription.
+    """Download a YouTube video and extract WAV audio from it.
 
-    Parameters
-    ----------
-    youtube_url : str   URL of the YouTube video to download.
-    out_dir     : Path  Directory in which to write the video and audio files.
-                        Must already exist (callers use tempfile.TemporaryDirectory).
+    Args:
+        youtube_url: The full YouTube video URL.
+        out_dir: Directory where both the video and audio files will be saved.
 
-    Returns
-    -------
-    video_path : Path   path to the downloaded .mp4
-    audio_path : Path   path to the extracted .wav
+    Returns:
+        A tuple of (video_path, audio_path).
     """
     video_path = out_dir / "video.mp4"
     audio_path = out_dir / "audio.wav"
 
+    # --- Download video -------------------------------------------------------
     ydl_opts = {
-        # Best single-file progressive MP4 up to 1080p; avoids merge step.
         "format": "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "outtmpl": str(video_path),
-        # Merge into MP4 even when separate streams are selected.
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
-        # Don't re-download if a previous run was interrupted and left a file.
-        "nooverwrites": False,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([youtube_url])
 
-    # yt-dlp may append part of the title to the filename; find it.
+    # Fallback: yt-dlp sometimes alters the filename (e.g. appending video ID).
     if not video_path.exists():
-        candidates = list(out_dir.glob("*.mp4"))
-        if not candidates:
+        mp4_files = list(out_dir.glob("*.mp4"))
+        if not mp4_files:
             raise FileNotFoundError(
-                f"yt-dlp did not produce an MP4 in {out_dir}"
+                f"yt-dlp finished but no .mp4 file found in {out_dir}. "
+                "Try updating yt-dlp: pip install -U yt-dlp"
             )
-        video_path = candidates[0]
+        video_path = mp4_files[0]
 
-    # Extract mono 16 kHz WAV — optimal for Whisper.
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", str(video_path),
-            "-vn",
-            "-ac", "1",
-            "-ar", "16000",
-            "-sample_fmt", "s16",
-            str(audio_path),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    # --- Extract audio --------------------------------------------------------
+    # mono, 16 kHz, 16-bit PCM WAV — optimal for Whisper
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", str(video_path),
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-sample_fmt", "s16",
+        str(audio_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg audio extraction failed:\n{result.stderr}"
+        )
 
     return video_path, audio_path

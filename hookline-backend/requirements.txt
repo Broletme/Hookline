@@ -1,8 +1,7 @@
-fastapi==0.115.5
-uvicorn[standard]==0.32.1
-yt-dlp>=2026.6.9
-groq==0.13.1
-supabase==2.10.0
-python-dotenv==1.0.1
-httpx==0.27.2
-python-multipart==0.0.17
+fastapi
+uvicorn[standard]
+yt-dlp>=2025.6.0
+groq
+python-dotenv
+supabase
+python-multipart

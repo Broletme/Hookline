@@ -1,26 +1,19 @@
-# Python
+# Environment — never commit real credentials
+.env
+.env.local
+.env.*.local
+
+# Python cache
 __pycache__/
 *.py[cod]
 *.pyo
-.Python
+*.pyd
+
+# Virtual environments
 venv/
 .venv/
 env/
-*.egg-info/
-dist/
-build/
 
-# Environment — ignore real secrets, track the example template
-.env
-.env.local
-# .env.example is intentionally committed (contains only placeholders)
-
-# Processing temp files (written to OS temp dir, auto-cleaned up — nothing to ignore)
-# IDE
-.vscode/
-.idea/
-*.swp
-
-# OS
-.DS_Store
+# Temp / OS
+*.DS_Store
 Thumbs.db

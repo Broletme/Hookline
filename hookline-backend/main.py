@@ -1,20 +1,15 @@
 """
-main.py — FastAPI application for Hookline.
+main.py — Hookline FastAPI application.
 
-Endpoints
----------
-POST /jobs          Accept a YouTube URL, create a DB job, kick off pipeline.
-GET  /jobs/{id}     Poll job status; returns clips when done.
+Pipeline stages per job:
+  queued → downloading → transcribing → scoring → clipping → uploading → done
+  Any stage can transition to: failed
 
-Pipeline stages (run in a FastAPI BackgroundTask):
-  1. download   — yt-dlp + ffmpeg audio extract
-  2. transcribe — Groq Whisper large-v3
-  3. score      — Groq LLM clip candidate selection
-  4. clip       — ffmpeg segment cutting
-  5. upload     — Supabase Storage + DB write
+CORS: Origins are loaded from the CORS_ORIGINS env var (comma-separated).
+Fallback: http://localhost:3000
+Without this middleware the browser will silently fail with "Failed to fetch"
+because Next.js runs on a different origin to FastAPI.
 """
-
-from __future__ import annotations
 
 import os
 import tempfile
@@ -22,186 +17,186 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-
-load_dotenv()  # Must happen before any module-level os.getenv() calls.
-
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 
-from clipper import cut_clips
+# Load .env before importing modules that read env vars at call time
+load_dotenv()
+
+from clipper import cut_clip
 from download import download_video
-from scorer import score_transcript
-from storage import (
-    create_job,
-    get_job,
-    save_clips_to_job,
-    set_status,
-    update_job,
-    upload_clip,
-)
-from transcribe import transcribe_audio
+from scorer import score_clips
+from storage import save_job_status, upload_clip
+from transcribe import format_transcript_for_llm, transcribe_audio
 
-# ── Config ────────────────────────────────────────────────────────────────────
-# No persistent WORK_DIR — each job gets a tempfile.TemporaryDirectory that is
-# automatically deleted once clips are uploaded to Supabase Storage.
-CORS_ORIGINS = [
-    o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
-]
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
 
-# ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="Hookline API",
-    description="Extract viral clip candidates from YouTube videos.",
-    version="0.1.0",
-)
+app = FastAPI(title="Hookline API", version="1.0.0")
+
+_raw_origins = os.environ.get("CORS_ORIGINS", "http://localhost:3000")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------------
+# Request / Response models
+# ---------------------------------------------------------------------------
 
-# ── Request / Response schemas ────────────────────────────────────────────────
+
 class CreateJobRequest(BaseModel):
-    youtube_url: str  # plain str so we accept youtu.be short links etc.
-
-
-class ClipResponse(BaseModel):
-    index: int
-    start: float
-    end: float
-    score: int
-    reason: str
-    url: str
-
-
-class JobResponse(BaseModel):
-    id: str
     youtube_url: str
-    status: str
-    error: str | None = None
-    clips: list[ClipResponse] | None = None
 
 
-# ── Pipeline ──────────────────────────────────────────────────────────────────
-async def process_job(job_id: str, youtube_url: str) -> None:
-    """
-    Full pipeline orchestrator.  Runs as a FastAPI BackgroundTask so the
-    POST /jobs response is immediate.
-
-    All intermediate files (video, audio, clips) are written to a
-    tempfile.TemporaryDirectory that is automatically deleted once clips
-    are uploaded to Supabase Storage — nothing persists locally.
-
-    Any unhandled exception updates the job status to "error".
-    """
-    try:
-        with tempfile.TemporaryDirectory(prefix=f"hookline_{job_id}_") as tmp:
-            tmp_path = Path(tmp)
-
-            # 1. Download ──────────────────────────────────────────────────────
-            set_status(job_id, "downloading")
-            video_path, audio_path = download_video(youtube_url, tmp_path)
-
-            # 2. Transcribe ────────────────────────────────────────────────────
-            set_status(job_id, "transcribing")
-            segments = transcribe_audio(audio_path)
-            update_job(job_id, transcript=segments)
-
-            # Infer total duration from last segment end time.
-            total_duration: float | None = None
-            if segments:
-                total_duration = segments[-1]["end"]
-
-            # 3. Score ─────────────────────────────────────────────────────────
-            set_status(job_id, "scoring")
-            candidates = score_transcript(segments, total_duration=total_duration)
-
-            if not candidates:
-                # Edge case: LLM found no suitable clips (very short / music video).
-                save_clips_to_job(job_id, [])
-                return
-
-            # 4. Cut clips ─────────────────────────────────────────────────────
-            set_status(job_id, "clipping")
-            clips_dir = tmp_path / "clips"
-            clip_paths = cut_clips(video_path, candidates, clips_dir)
-
-            # 5. Upload to Supabase Storage ────────────────────────────────────
-            # All clips are uploaded before the TemporaryDirectory context exits
-            # and local files are wiped.
-            set_status(job_id, "uploading")
-            clip_descriptors = []
-            for idx, (clip_path, candidate) in enumerate(zip(clip_paths, candidates)):
-                descriptor = upload_clip(job_id, clip_path, idx, candidate)
-                clip_descriptors.append(descriptor)
-
-        # TemporaryDirectory is deleted here — video, audio, and clip files
-        # are gone; only the Supabase Storage copies remain.
-
-        # 6. Persist and mark done ─────────────────────────────────────────────
-        save_clips_to_job(job_id, clip_descriptors)
-
-    except Exception as exc:  # noqa: BLE001
-        set_status(job_id, "error", error=str(exc))
-        raise
+class CreateJobResponse(BaseModel):
+    job_id: str
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-@app.post("/jobs", response_model=JobResponse, status_code=202)
-async def create_job_endpoint(
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+
+@app.post("/jobs", response_model=CreateJobResponse, status_code=202)
+async def create_job(
     body: CreateJobRequest,
     background_tasks: BackgroundTasks,
-) -> JobResponse:
-    """
-    Create a new processing job and return immediately.
-    Poll GET /jobs/{id} to track progress.
-    """
+) -> CreateJobResponse:
+    """Create a new processing job and start the pipeline in the background."""
     job_id = str(uuid.uuid4())
-    try:
-        job = create_job(job_id, body.youtube_url)
-    except Exception as exc:
-        error_msg = str(exc)
-        if "Could not find the table 'public.jobs'" in error_msg:
-            raise HTTPException(
-                status_code=500,
-                detail="Database table 'jobs' is missing. Please run schema.sql in your Supabase SQL editor."
-            )
-        raise HTTPException(status_code=500, detail=f"Database error: {error_msg}")
+
+    save_job_status(
+        job_id,
+        "queued",
+        {"youtube_url": body.youtube_url},
+    )
 
     background_tasks.add_task(process_job, job_id, body.youtube_url)
 
-    return JobResponse(
-        id=job["id"],
-        youtube_url=job["youtube_url"],
-        status=job["status"],
-    )
+    return CreateJobResponse(job_id=job_id)
 
 
-@app.get("/jobs/{job_id}", response_model=JobResponse)
-async def get_job_endpoint(job_id: str) -> JobResponse:
-    """Return current job state including clips once processing is complete."""
-    job = get_job(job_id)
-    if job is None:
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str) -> dict:
+    """Return the current state of a job from Supabase."""
+    from storage import _get_client
+
+    client = _get_client()
+    result = client.table("jobs").select("*").eq("id", job_id).execute()
+
+    if not result.data:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    clips = None
-    if job.get("clips"):
-        clips = [ClipResponse(**c) for c in job["clips"]]
-
-    return JobResponse(
-        id=job["id"],
-        youtube_url=job["youtube_url"],
-        status=job["status"],
-        error=job.get("error"),
-        clips=clips,
-    )
+    return result.data[0]
 
 
-@app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+# ---------------------------------------------------------------------------
+# Background pipeline
+# ---------------------------------------------------------------------------
+
+
+def process_job(job_id: str, youtube_url: str) -> None:
+    """Run the full Hookline pipeline for a single job.
+
+    Runs inside a temporary directory that is cleaned up automatically on exit.
+    Supabase is updated at every stage so the frontend can show live progress.
+    """
+    with tempfile.TemporaryDirectory() as tmp_str:
+        tmp = Path(tmp_str)
+
+        try:
+            # 1. Download
+            save_job_status(job_id, "downloading", {"youtube_url": youtube_url})
+            video_path, audio_path = download_video(youtube_url, tmp)
+
+            # 2. Transcribe
+            save_job_status(job_id, "transcribing", {"youtube_url": youtube_url})
+            transcript_data = transcribe_audio(audio_path)
+            segments = transcript_data["segments"]
+            full_text = transcript_data["full_text"]
+
+            # Derive video duration from last segment end time
+            video_duration = segments[-1]["end"] if segments else 0.0
+            formatted_transcript = format_transcript_for_llm(segments)
+
+            # 3. Score
+            save_job_status(
+                job_id,
+                "scoring",
+                {
+                    "youtube_url": youtube_url,
+                    "transcript": transcript_data,
+                },
+            )
+            scored_clips = score_clips(formatted_transcript, video_duration)
+
+            if not scored_clips:
+                raise ValueError("LLM returned zero valid clip candidates.")
+
+            # 4. Cut clips
+            save_job_status(
+                job_id,
+                "clipping",
+                {
+                    "youtube_url": youtube_url,
+                    "transcript": transcript_data,
+                },
+            )
+            clip_paths: list[tuple[int, Path, dict]] = []
+            for i, clip in enumerate(scored_clips):
+                out_path = tmp / f"clip_{i}.mp4"
+                cut_clip(video_path, clip["start"], clip["end"], out_path)
+                clip_paths.append((i, out_path, clip))
+
+            # 5. Upload clips
+            save_job_status(
+                job_id,
+                "uploading",
+                {
+                    "youtube_url": youtube_url,
+                    "transcript": transcript_data,
+                },
+            )
+            final_clips = []
+            for i, out_path, clip in clip_paths:
+                url = upload_clip(out_path, job_id, i)
+                final_clips.append(
+                    {
+                        "url": url,
+                        "start": clip["start"],
+                        "end": clip["end"],
+                        "score": clip["score"],
+                        "reason": clip["reason"],
+                    }
+                )
+
+            # 6. Done
+            save_job_status(
+                job_id,
+                "done",
+                {
+                    "youtube_url": youtube_url,
+                    "transcript": transcript_data,
+                    "clips": final_clips,
+                },
+            )
+
+        except Exception as exc:  # noqa: BLE001
+            save_job_status(
+                job_id,
+                "failed",
+                {
+                    "youtube_url": youtube_url,
+                    "error": str(exc),
+                },
+            )
+            # Re-raise so uvicorn logs the traceback for debugging
+            raise

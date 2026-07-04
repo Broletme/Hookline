@@ -1,108 +1,67 @@
 """
-transcribe.py — Transcribe audio using Groq-hosted Whisper large-v3.
-
-Returns a list of segment dicts, each with word-level timestamps:
-[
-    {
-        "id": 0,
-        "start": 0.0,
-        "end": 4.3,
-        "text": "Welcome to today's episode...",
-        "words": [
-            {"word": "Welcome", "start": 0.0, "end": 0.4},
-            ...
-        ]
-    },
-    ...
-]
+transcribe.py — Transcribe audio using Groq's Whisper-large-v3.
 """
-
-from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
 
 from groq import Groq
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-WHISPER_MODEL = "whisper-large-v3"
 
-_client: Groq | None = None
+def transcribe_audio(audio_path: Path) -> dict:
+    """Transcribe audio and return structured segments.
 
+    Args:
+        audio_path: Path to the audio file (WAV, mono 16 kHz recommended).
 
-def _get_client() -> Groq:
-    global _client
-    if _client is None:
-        _client = Groq(api_key=GROQ_API_KEY)
-    return _client
-
-
-def transcribe_audio(audio_path: Path) -> list[dict[str, Any]]:
+    Returns:
+        dict with keys:
+          - "full_text": complete transcript string
+          - "segments": list of {"start": float, "end": float, "text": str}
     """
-    Send *audio_path* to Groq Whisper and return a list of segments
-    with word-level timestamps.
+    client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-    Parameters
-    ----------
-    audio_path : Path
-        Path to a 16 kHz mono WAV file produced by download.py.
-
-    Returns
-    -------
-    list[dict]  — segment objects (see module docstring)
-    """
-    client = _get_client()
-
-    with open(audio_path, "rb") as f:
+    with open(audio_path, "rb") as audio_file:
         response = client.audio.transcriptions.create(
-            model=WHISPER_MODEL,
-            file=(audio_path.name, f, "audio/wav"),
+            file=(audio_path.name, audio_file),
+            model="whisper-large-v3",
             response_format="verbose_json",
-            timestamp_granularities=["word", "segment"],
+            timestamp_granularities=["segment", "word"],
         )
 
-    segments: list[dict[str, Any]] = []
-    raw_segs = getattr(response, "segments", []) or []
+    # The response object has .text and .segments
+    segments = []
+    for seg in response.segments or []:
+        segments.append(
+            {
+                "start": float(seg.get("start", 0)),
+                "end": float(seg.get("end", 0)),
+                "text": seg.get("text", "").strip(),
+            }
+        )
 
-    for i, seg in enumerate(raw_segs):
-        # Groq returns Pydantic-like objects; normalise to plain dicts.
-        seg_dict: dict[str, Any] = {
-            "id": i,
-            "start": float(seg.start),
-            "end": float(seg.end),
-            "text": seg.text.strip(),
-            "words": [],
-        }
-
-        raw_words = getattr(seg, "words", []) or []
-        for w in raw_words:
-            seg_dict["words"].append(
-                {
-                    "word": getattr(w, "word", ""),
-                    "start": float(getattr(w, "start", seg.start)),
-                    "end": float(getattr(w, "end", seg.end)),
-                }
-            )
-
-        segments.append(seg_dict)
-
-    return segments
+    return {
+        "full_text": response.text,
+        "segments": segments,
+    }
 
 
-def segments_to_plain_text(segments: list[dict[str, Any]]) -> str:
-    """Collapse segment list into a single plain-text string for LLM input."""
-    return " ".join(s["text"] for s in segments).strip()
+def format_transcript_for_llm(segments: list[dict]) -> str:
+    """Format transcript segments into a timestamped string for the LLM.
 
+    Example output line:
+        [12.4s - 15.1s] And that's why I believe this changes everything.
 
-def segments_to_timestamped_text(segments: list[dict[str, Any]]) -> str:
-    """
-    Produce a compact timestamped transcript suitable for the scoring LLM.
-    Format: [MM:SS] segment text
+    Args:
+        segments: List of segment dicts with "start", "end", "text" keys.
+
+    Returns:
+        Multi-line string suitable for inclusion in an LLM prompt.
     """
     lines = []
     for seg in segments:
-        start_s = int(seg["start"])
-        mm, ss = divmod(start_s, 60)
-        lines.append(f"[{mm:02d}:{ss:02d}] {seg['text']}")
+        start = seg["start"]
+        end = seg["end"]
+        text = seg["text"]
+        lines.append(f"[{start:.1f}s - {end:.1f}s] {text}")
     return "\n".join(lines)

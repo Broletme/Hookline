@@ -1,178 +1,100 @@
 """
-scorer.py — Identify viral clip candidates using a Groq LLM.
-
-Takes the timestamped transcript produced by transcribe.py and asks
-an LLM to return JSON describing 30–90 second segments that work as
-standalone hooks.
-
-Output schema (list of ClipCandidate dicts):
-[
-    {
-        "start": 12.4,       # float, seconds from video start
-        "end":   58.1,       # float, seconds from video start
-        "score": 87,         # int 0–100, viral likelihood
-        "reason": "Opens with a shocking statistic then resolves a curiosity gap."
-    },
-    ...
-]
-Sorted descending by score. Max 8 candidates returned.
+scorer.py — Score transcript segments for viral clip potential using a Groq LLM.
 """
-
-from __future__ import annotations
 
 import json
 import os
 import re
-from typing import Any
 
 from groq import Groq
 
-from transcribe import segments_to_timestamped_text
+_SYSTEM_PROMPT = """You are a social-media content strategist who specialises in identifying
+short-form viral clips from long-form video transcripts.
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-SCORER_MODEL = "llama-3.3-70b-versatile"
-MAX_CLIPS = 8
-MIN_DURATION = 25   # seconds — allow slight slack below 30 s
-MAX_DURATION = 95   # seconds — allow slight slack above 90 s
+Given a timestamped transcript, identify 3-6 segments that would work as
+standalone hooks for TikTok / Instagram Reels / YouTube Shorts.
 
-_SYSTEM_PROMPT = """\
-You are a viral content strategist with deep expertise in short-form video.
-Your job is to identify the strongest 30–90 second clips from a video transcript
-that would perform well as standalone social media content.
+Each segment MUST:
+- Be 30–90 seconds long (use start/end times from the transcript).
+- Have a strong opening line that works without prior context.
+- Be self-contained — no unresolved references like "as I mentioned earlier."
+- Feature at least one of: emotional peak, surprising/controversial statement,
+  a complete mini-story arc, or a clear actionable insight.
+- Have start and end times that exactly match timestamp values that appear in
+  the provided transcript. Do NOT invent timestamps outside the transcript range.
 
-For each candidate clip, evaluate:
-• Strong hook / opening line that grabs attention in the first 3 seconds
-• Complete thought or story arc (beginning, tension, resolution)
-• Emotional peak — surprise, curiosity, humour, or inspiration
-• Curiosity gap — makes the viewer want to know more
-• Quotable or shareable moment
-• Self-contained — understandable without the rest of the video
-
-Return ONLY a valid JSON array (no markdown, no prose, no ```).
-Each element must have exactly these fields:
-  "start"  : number (seconds, float)
-  "end"    : number (seconds, float)
-  "score"  : integer 0-100 (viral likelihood)
-  "reason" : string (1–2 sentences explaining why this clip is strong)
-
-Rules:
-- Clip duration must be between 30 and 90 seconds.
-- Return between 1 and 8 clips, sorted by score descending.
-- Timestamps must map exactly to segment boundaries in the transcript.
-- Do NOT fabricate timestamps that aren't in the transcript.
+Return ONLY a valid JSON array — no markdown fences, no explanation, no preamble.
+Format:
+[
+  {"start": <float>, "end": <float>, "score": <int 1-10>, "reason": "<why this clip works>"},
+  ...
+]
 """
 
-_USER_TEMPLATE = """\
-Here is the timestamped transcript. Each line starts with [MM:SS] indicating
-the segment's start time in the video.
 
----
-{transcript}
----
+def score_clips(transcript_text: str, video_duration: float) -> list[dict]:
+    """Use an LLM to identify and score the best viral clip candidates.
 
-Identify the best viral clip candidates and return the JSON array.
-"""
+    Args:
+        transcript_text: Formatted transcript string from format_transcript_for_llm().
+        video_duration: Total video duration in seconds (used for context).
 
-_client: Groq | None = None
+    Returns:
+        List of dicts: [{"start": float, "end": float, "score": int, "reason": str}]
 
-
-def _get_client() -> Groq:
-    global _client
-    if _client is None:
-        _client = Groq(api_key=GROQ_API_KEY)
-    return _client
-
-
-def _extract_json(text: str) -> list[dict[str, Any]]:
+    Raises:
+        ValueError: If the LLM returns unparseable JSON.
     """
-    Robustly extract a JSON array from LLM output that may contain
-    surrounding prose or markdown fences.
-    """
-    # Try direct parse first.
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+    client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-    # Strip markdown fences.
-    cleaned = re.sub(r"```(?:json)?", "", text).strip()
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
+    user_message = (
+        f"Video duration: {video_duration:.1f} seconds\n\n"
+        f"Transcript:\n{transcript_text}"
+    )
 
-    # Last resort: find first '[' … ']' block.
-    match = re.search(r"(\[.*\])", text, re.DOTALL)
-    if match:
-        return json.loads(match.group(1))
-
-    raise ValueError(f"Could not extract JSON array from LLM response:\n{text[:500]}")
-
-
-def _validate_clips(
-    raw: list[dict[str, Any]],
-    total_duration: float | None = None,
-) -> list[dict[str, Any]]:
-    """Validate and normalise clip candidates."""
-    valid = []
-    for item in raw:
-        try:
-            start = float(item["start"])
-            end = float(item["end"])
-            score = max(0, min(100, int(item["score"])))
-            reason = str(item.get("reason", "")).strip()
-            duration = end - start
-
-            if duration < MIN_DURATION or duration > MAX_DURATION:
-                continue
-            if start < 0:
-                continue
-            if total_duration and end > total_duration + 5:
-                continue
-
-            valid.append(
-                {"start": start, "end": end, "score": score, "reason": reason}
-            )
-        except (KeyError, TypeError, ValueError):
-            continue
-
-    # Sort descending by score, cap at MAX_CLIPS.
-    valid.sort(key=lambda c: c["score"], reverse=True)
-    return valid[:MAX_CLIPS]
-
-
-def score_transcript(
-    segments: list[dict[str, Any]],
-    total_duration: float | None = None,
-) -> list[dict[str, Any]]:
-    """
-    Given word-timestamped *segments* from transcribe.py, return a list
-    of clip candidate dicts sorted descending by viral score.
-
-    Parameters
-    ----------
-    segments : list[dict]
-        Transcript segments as returned by transcribe.transcribe_audio().
-    total_duration : float | None
-        Total video duration in seconds, used to sanity-check end times.
-
-    Returns
-    -------
-    list[dict]  — validated ClipCandidate objects
-    """
-    transcript_text = segments_to_timestamped_text(segments)
-
-    client = _get_client()
     response = client.chat.completions.create(
-        model=SCORER_MODEL,
+        model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": _USER_TEMPLATE.format(transcript=transcript_text)},
+            {"role": "user", "content": user_message},
         ],
-        temperature=0.2,   # low temp for deterministic JSON
+        temperature=0.3,
         max_tokens=2048,
     )
 
-    raw_text = response.choices[0].message.content or ""
-    raw_clips = _extract_json(raw_text)
-    return _validate_clips(raw_clips, total_duration)
+    raw = response.choices[0].message.content.strip()
+
+    # Strip any accidental markdown code fences the model might have added
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
+    raw = raw.strip()
+
+    try:
+        clips = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"LLM returned invalid JSON. Raw response:\n{raw}\n\nError: {exc}"
+        ) from exc
+
+    if not isinstance(clips, list):
+        raise ValueError(
+            f"LLM JSON was not a list. Got: {type(clips).__name__}"
+        )
+
+    # Normalise and validate each clip entry
+    validated = []
+    for item in clips:
+        try:
+            validated.append(
+                {
+                    "start": float(item["start"]),
+                    "end": float(item["end"]),
+                    "score": int(item["score"]),
+                    "reason": str(item.get("reason", "")),
+                }
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            # Skip malformed entries rather than crashing the whole job
+            print(f"[scorer] Skipping malformed clip entry {item!r}: {exc}")
+
+    return validated
