@@ -36,6 +36,7 @@ def cut_clip(
         "-ss", str(start),
         "-to", str(end),
         "-c", "copy",
+        "-movflags", "+faststart",  # move moov atom to front — required for browser playback
         str(out_path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
